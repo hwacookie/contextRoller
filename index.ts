@@ -20,13 +20,17 @@ import { join } from "node:path";
 import {
 	CONFIG_DIR_NAME,
 	convertToLlm,
+	DynamicBorder,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 	estimateTokens,
+	getMarkdownTheme,
 	serializeConversation,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { type AgentMessage, type AssistantMessage, type Model, uuidv7 } from "@earendil-works/pi-ai";
+import { Markdown, matchesKey } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Configuration (SPEC §5.5)
@@ -471,6 +475,80 @@ export default function (pi: ExtensionAPI) {
 		// TODO(diary): flush the pending diary window — SPEC §5.7.
 	});
 
+	/**
+	 * FR-7: scrollable Markdown viewer for the rolling summary with token count.
+	 * Rendered as a centered overlay; the document is clipped to the viewport
+	 * manually (main-screen mode renders components without the flex layout
+	 * engine, so pi-tui's ScrollView would not get a viewport there).
+	 */
+	async function showSummaryViewer(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui") return; // non-TUI callers keep the notify fallback
+		await ctx.ui.custom(
+			(tui, theme, _kb, done) => {
+				const md = new Markdown(state.summaryText, 1, 0, getMarkdownTheme());
+				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
+				let scrollTop = 0;
+				let docLines: string[] = [];
+				let docWidth = 0;
+
+				// Rows around the document: top border, title, meta line, hint line, bottom border.
+				const CHROME_ROWS = 5;
+				const MARGIN = 2; // must match overlayOptions.margin below
+				const viewportRows = () => Math.max(4, tui.terminal.rows - 2 * MARGIN - CHROME_ROWS);
+
+				const renderDoc = (width: number): string[] => {
+					const inner = Math.max(10, width - 2); // one padding column per side inside the border
+					if (inner !== docWidth) {
+						docLines = md.render(inner);
+						docWidth = inner;
+					}
+					const viewH = viewportRows();
+					scrollTop = Math.max(0, Math.min(scrollTop, Math.max(0, docLines.length - viewH)));
+					return docLines.slice(scrollTop, scrollTop + viewH);
+				};
+
+				const meta = [
+					`~${estimateTextTokens(state.summaryText)} tokens`,
+					config.maxSummaryTokens > 0 ? `budget ${config.maxSummaryTokens}` : undefined,
+					state.updatedAt ? `updated ${new Date(state.updatedAt).toLocaleTimeString()}` : undefined,
+				]
+					.filter((part): part is string => part !== undefined)
+					.join(" · ");
+
+				return {
+					render: (width: number) => [
+						...topBorder.render(width),
+						` ${theme.fg("accent", theme.bold("contextRoller — rolling summary"))}`,
+						` ${theme.fg("dim", meta)}`,
+						...renderDoc(width),
+						` ${theme.fg("dim", "↑↓ scroll · PgUp/PgDn page · Home/End jump · q/Enter/Esc close")}`,
+						...bottomBorder.render(width),
+					],
+					invalidate: () => {
+						docWidth = 0; // force the document to re-render on the next frame
+					},
+					handleInput: (data: string) => {
+						if (matchesKey(data, "q") || matchesKey(data, "enter") || matchesKey(data, "escape")) {
+							done(undefined);
+							return;
+						}
+						const page = Math.max(3, viewportRows() - 2);
+						if (matchesKey(data, "up")) scrollTop = Math.max(0, scrollTop - 1);
+						else if (matchesKey(data, "down")) scrollTop += 1; // clamped in renderDoc
+						else if (matchesKey(data, "pageup")) scrollTop = Math.max(0, scrollTop - page);
+						else if (matchesKey(data, "pagedown")) scrollTop += page;
+						else if (matchesKey(data, "home")) scrollTop = 0;
+						else if (matchesKey(data, "end")) scrollTop = Number.MAX_SAFE_INTEGER; // clamped in renderDoc
+						else return;
+						tui.requestRender();
+					},
+				};
+			},
+			{ overlay: true, overlayOptions: { anchor: "center", margin: 2, width: "90%" } },
+		);
+	}
+
 	pi.registerCommand("contextRoller", {
 		description: "Manage rolling context summary + diary (model | now | show | diary [now])",
 		handler: async (args, ctx) => {
@@ -491,9 +569,19 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(statusText(), "info");
 					break;
 				}
-				case "show":
-					ctx.ui.notify(state.summaryText || "(no summary yet)", "info");
+				case "show": {
+					if (!state.summaryText) {
+						ctx.ui.notify("contextRoller: no summary yet", "info");
+						break;
+					}
+					if (ctx.mode !== "tui") {
+						// Non-TUI modes (e.g. RPC): plain text, token count on the first line.
+						ctx.ui.notify(`~${estimateTextTokens(state.summaryText)} tokens\n${state.summaryText}`, "info");
+						break;
+					}
+					await showSummaryViewer(ctx);
 					break;
+				}
 				case "diary":
 					// TODO(diary): show today's diary tail / flush now — SPEC §5.7.
 					ctx.ui.notify(

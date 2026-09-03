@@ -27,7 +27,7 @@ Long-running sessions with large-context models eventually hit the context limit
 | `/contextRoller` | Status: secondary model, last update, summary size |
 | `/contextRoller model` | Pick the secondary model (fuzzy search) |
 | `/contextRoller now` | Force a summary catch-up update |
-| `/contextRoller show` | Show the current rolling summary |
+| `/contextRoller show` | Open the rolling summary in a scrollable Markdown viewer (token count + budget) |
 | `/contextRoller diary` | Show today's diary entries |
 | `/contextRoller diary now` | Flush the current diary window immediately |
 
