@@ -407,10 +407,10 @@ export default function (pi: ExtensionAPI) {
 - [x] API verification against pi 0.84.3 (hook names, custom compaction semantics, model registry — see §4)
 - [x] Use case 2 (project diary) specified (§5.7, FR-6)
 - [x] Public GitHub repository, README, English-only documentation rule (AGENTS.md)
+- [x] Extension scaffold (`index.ts`): config loading, state restore, hook stubs, `/contextRoller` command; loads cleanly via `pi -e ./index.ts`
 
 ### TODO
 
-- [ ] Scaffold the extension in this repo (`index.ts` + `package.json` if needed); load with `pi -e ./index.ts`
 - [ ] Background worker: `turn_end` deltas, FIFO queue, persistence via `appendEntry`; verify round-trip across `/reload` and restart
 - [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down)
 - [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
