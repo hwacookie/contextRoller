@@ -428,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 - [x] Token budget machinery (FR-7): `maxSummaryTokens` config, prompt clause + per-update compression pass, handoff guarantee at compaction
 - [x] Local server registration via `models.json`; end-to-end RPC test: three compactions in one session against the local secondary model
 - [x] `/contextRoller show`: scrollable Markdown viewer overlay with token count + budget + last update (FR-7); manual viewport clipping (main-screen mode renders without the flex layout engine, so pi-tui's ScrollView would not get a viewport there); verified in a real TUI session
+- [x] `/contextRoller` command: status | model | now | show all implemented. `model` is a fuzzy picker (`Input` + `SelectList` + `fuzzyFilter`) over the live registry `getAvailable()` (full `/model` parity); provider shown in the description column because display names are not unique across providers; selection persists to the config file that provided `model` (project file if unset); main model never touched (no `setModel` call anywhere). Verified in a real TUI session incl. filter, select, persist, and main-model-untouched
 
 ### TODO
-- [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
 - [ ] Project diary: windowing, flush triggers, per-day/per-user files under `<project>/diary/`; verify entries survive restarts, capture discarded approaches, and never enter LLM context

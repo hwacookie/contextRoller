@@ -13,7 +13,8 @@
  * own output and the RPC protocol.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -26,11 +27,12 @@ import {
 	type ExtensionContext,
 	estimateTokens,
 	getMarkdownTheme,
+	getSelectListTheme,
 	serializeConversation,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { type AgentMessage, type AssistantMessage, type Model, uuidv7 } from "@earendil-works/pi-ai";
-import { Markdown, matchesKey } from "@earendil-works/pi-tui";
+import { fuzzyFilter, Input, Markdown, matchesKey, SelectList } from "@earendil-works/pi-tui";
 
 // ---------------------------------------------------------------------------
 // Configuration (SPEC §5.5)
@@ -62,25 +64,47 @@ const DEFAULT_CONFIG: ContextRollerConfig = {
 };
 
 /** Load config: global (~/.pi/agent) first, project (.pi/) overrides. */
-function loadConfig(cwd: string): ContextRollerConfig {
+function loadConfig(cwd: string): { config: ContextRollerConfig; modelSourcePath: string | null } {
 	const candidates = [
 		join(homedir(), CONFIG_DIR_NAME, "agent", "contextRoller.json"),
 		join(cwd, CONFIG_DIR_NAME, "contextRoller.json"),
 	];
 	let merged: Record<string, unknown> = {};
+	let modelSourcePath: string | null = null;
 	for (const path of candidates) {
 		if (!existsSync(path)) continue;
 		try {
-			merged = { ...merged, ...(JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>) };
+			const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+			if (typeof parsed.model === "string") modelSourcePath = path; // last (most specific) wins
+			merged = { ...merged, ...parsed };
 		} catch (err) {
 			console.error(`[contextRoller] failed to parse config ${path}:`, err);
 		}
 	}
 	return {
-		...DEFAULT_CONFIG,
-		...merged,
-		diary: { ...DEFAULT_CONFIG.diary, ...(merged.diary as Partial<DiaryConfig> | undefined) },
+		config: {
+			...DEFAULT_CONFIG,
+			...merged,
+			diary: { ...DEFAULT_CONFIG.diary, ...(merged.diary as Partial<DiaryConfig> | undefined) },
+		},
+		modelSourcePath,
 	};
+}
+
+/** Persist the selected secondary model back to its config file (project file if unset). */
+function persistModel(cwd: string, sourcePath: string | null, model: string): void {
+	const target = sourcePath ?? join(cwd, CONFIG_DIR_NAME, "contextRoller.json");
+	try {
+		let existing: Record<string, unknown> = {};
+		if (existsSync(target)) {
+			existing = JSON.parse(readFileSync(target, "utf8")) as Record<string, unknown>;
+		}
+		existing.model = model;
+		mkdirSync(dirname(target), { recursive: true });
+		writeFileSync(target, JSON.stringify(existing, null, 2) + "\n");
+	} catch (err) {
+		console.error("[contextRoller] failed to persist model selection:", err);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +230,7 @@ function estimateTextTokens(text: string): number {
 
 export default function (pi: ExtensionAPI) {
 	let config: ContextRollerConfig = DEFAULT_CONFIG;
+	let modelSourcePath: string | null = null; // which config file provided `model` (for write-back)
 	let state: RollingSummaryState = { ...EMPTY_STATE };
 	let queue: QueuedDelta[] = [];
 	let activePump: Promise<void> | null = null;
@@ -350,7 +375,9 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		config = loadConfig(ctx.cwd);
+		const loaded = loadConfig(ctx.cwd);
+		config = loaded.config;
+		modelSourcePath = loaded.modelSourcePath;
 		state = restoreState(ctx);
 		console.error(
 			`[contextRoller] loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"})`,
@@ -476,6 +503,87 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	/**
+	 * SPEC §5.4: fuzzy picker over the live model registry (full /model parity via
+	 * getAvailable()). Selection updates config.model and persists it to the config
+	 * file; the main conversation model is never touched.
+	 */
+	async function showModelPicker(ctx: ExtensionCommandContext): Promise<void> {
+		if (ctx.mode !== "tui") return; // non-TUI callers keep the notify fallback
+		const models = ctx.modelRegistry.getAvailable();
+		if (models.length === 0) {
+			ctx.ui.notify("contextRoller: no models available in registry", "warning");
+			return;
+		}
+
+		let picked: string | undefined;
+		await ctx.ui.custom((tui, theme, _kb, done) => {
+			const input = new Input();
+			let lastQuery = "";
+
+			const buildList = (query: string): SelectList => {
+				const filtered = fuzzyFilter(models, query, (m) => `${m.provider}/${m.id} ${m.name}`);
+				const items = filtered.map((m) => {
+					const ref = `${m.provider}/${m.id}`;
+					// Provider goes into the description: display names are not unique
+					// across providers (e.g. anthropic and github-copilot both offer
+					// "Claude Haiku 4.5 (latest)").
+					const notes = [m.provider];
+					if (ref === config.model) notes.push("current");
+					if (!ctx.modelRegistry.hasConfiguredAuth(m)) notes.push("no auth");
+					return { value: ref, label: m.name, description: notes.join(" · ") };
+				});
+				const list = new SelectList(items, 12, getSelectListTheme());
+				list.onSelect = (item) => {
+					picked = item.value;
+					done(picked);
+				};
+				return list;
+			};
+
+			let list = buildList("");
+			input.onEscape = () => done(undefined); // cancel — no change
+			input.onSubmit = () => {
+				const sel = list.getSelectedItem();
+				if (sel) {
+					picked = sel.value;
+					done(picked);
+				}
+			};
+
+			return {
+				render: (width: number) => [
+					` ${theme.fg("accent", theme.bold("contextRoller — secondary model"))}`,
+					` ${theme.fg("dim", "type to filter · ↑↓ select · Enter confirm · Esc cancel")}`,
+					...input.render(width),
+					...list.render(width),
+				],
+				invalidate: () => {
+					input.invalidate();
+					list.invalidate();
+				},
+				handleInput: (data: string) => {
+					if (matchesKey(data, "up") || matchesKey(data, "down")) {
+						list.handleInput(data);
+					} else {
+						input.handleInput(data);
+						const query = input.getValue();
+						if (query !== lastQuery) {
+							lastQuery = query;
+							list = buildList(query); // fuzzyFilter; SelectList.setFilter is prefix-only
+						}
+					}
+					tui.requestRender();
+				},
+			};
+		});
+
+		if (!picked) return; // cancelled
+		config.model = picked;
+		persistModel(ctx.cwd, modelSourcePath, picked);
+		ctx.ui.notify(`contextRoller: secondary model → ${picked}`, "info");
+	}
+
+	/**
 	 * FR-7: scrollable Markdown viewer for the rolling summary with token count.
 	 * Rendered as a centered overlay; the document is clipped to the viewport
 	 * manually (main-screen mode renders components without the flex layout
@@ -559,8 +667,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify(statusText(), "info");
 					break;
 				case "model":
-					// TODO(command): fuzzy picker over ctx.modelRegistry.getAvailable() — SPEC §5.4.
-					ctx.ui.notify("not implemented yet (TODO: fuzzy model picker)", "warning");
+					await showModelPicker(ctx);
 					break;
 				case "now": {
 					if (activePump) await activePump;
