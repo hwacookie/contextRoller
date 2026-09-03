@@ -13,10 +13,10 @@
  * own output and the RPC protocol.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, userInfo } from "node:os";
+import { dirname, join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
@@ -122,6 +122,55 @@ const EMPTY_STATE: RollingSummaryState = { summaryText: "", lastCoveredEntryId: 
 
 const STATE_ENTRY_TYPE = "rolling-summary";
 
+// ---------------------------------------------------------------------------
+// Project diary (SPEC §5.7, FR-6)
+// ---------------------------------------------------------------------------
+
+const DIARY_STATE_ENTRY_TYPE = "diary-window";
+
+interface DiaryWindowState {
+	/** Epoch ms of the first delta in the current window (0 = empty window). */
+	windowStartTs: number;
+	/** Raw accumulated deltas since the last flush. */
+	pendingDeltas: string;
+	/** Session entry id up to which the diary is written/pending. */
+	lastCoveredEntryId: string | null;
+}
+
+const EMPTY_DIARY_WINDOW: DiaryWindowState = { windowStartTs: 0, pendingDeltas: "", lastCoveredEntryId: null };
+
+const DIARY_PROMPT = `You maintain a project work diary for a coding agent session. Based ONLY on the raw conversation excerpt provided by the user, write diary bullets in exactly this format (no header, no preamble):
+
+- Worked on: <what was being worked on, naming files and approaches>
+- Done: <concrete completed results; "nothing yet" if none>
+- Tried & discarded: <approach> (reason: <why it was abandoned or failed>)
+- State: <concise state at the end of the window: what is open, what comes next>
+
+Rules:
+- Include the "Tried & discarded" line only if something was actually tried and abandoned or failed; otherwise omit that line entirely.
+- Be specific (file names, commands, error messages). The "Tried & discarded" line is the diary's unique value over a rolling summary — capture dead ends with reasons.
+- Keep the whole entry under 20 lines. Output only the bullets.`;
+
+let cachedDiaryUser: string | null = null;
+
+/** Diary file user part: git user.name (sanitized), fallback OS username. */
+function diaryUserName(cwd: string): string {
+	if (cachedDiaryUser) return cachedDiaryUser;
+	let name: string | undefined;
+	try {
+		name = execFileSync("git", ["config", "user.name"], { cwd, encoding: "utf8", timeout: 3000 }).trim();
+	} catch {
+		/* not a git repo or user unset — fall through */
+	}
+	if (!name) name = userInfo().username;
+	cachedDiaryUser = name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "unknown";
+	return cachedDiaryUser;
+}
+
+const localDate = (d: Date): string =>
+	`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const localTime = (d: Date): string => d.toTimeString().slice(0, 5);
+
 /** Non-matching firstKeptEntryId → pi keeps nothing before the compaction entry (SPEC §4 fact 2). */
 const KEEP_NONE_ID = "contextRoller-keep-none";
 
@@ -187,11 +236,22 @@ Rules:
 ...
 </modified-files>`;
 
-interface QueuedDelta {
-	text: string;
-	/** Session leaf id at enqueue time — becomes the coverage marker on success. */
-	entryId: string;
-}
+/** Jobs processed sequentially by the pump (one secondary-model call each). */
+type QueuedJob =
+	| {
+			kind: "summary";
+			text: string;
+			/** Session leaf id at enqueue time — becomes the coverage marker on success. */
+			entryId: string;
+	  }
+	| {
+			kind: "diary";
+			/** Raw accumulated deltas of the window (SPEC §5.7: source of truth). */
+			text: string;
+			windowStartTs: number;
+			flushTs: number;
+			entryId: string;
+	  };
 
 const MAX_QUEUE = 50; // cap memory if the secondary server is down for a long time
 
@@ -232,9 +292,9 @@ export default function (pi: ExtensionAPI) {
 	let config: ContextRollerConfig = DEFAULT_CONFIG;
 	let modelSourcePath: string | null = null; // which config file provided `model` (for write-back)
 	let state: RollingSummaryState = { ...EMPTY_STATE };
-	let queue: QueuedDelta[] = [];
+	let queue: QueuedJob[] = [];
 	let activePump: Promise<void> | null = null;
-	// TODO(diary): diary buffer + lastDiaryFlush (SPEC §5.7).
+	let diaryWindow: DiaryWindowState = { ...EMPTY_DIARY_WINDOW };
 
 	function statusText(): string {
 		const model = config.model ?? "not configured";
@@ -337,12 +397,89 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	/** Persist the diary window as a custom entry so it survives restarts. */
+	function persistDiaryWindow(ctx: ExtensionContext): void {
+		pi.appendEntry(DIARY_STATE_ENTRY_TYPE, diaryWindow);
+	}
+
+	/** Reconstruct the diary window from the latest persisted custom entry on the branch. */
+	function restoreDiaryWindow(ctx: ExtensionContext): DiaryWindowState {
+		const branch = ctx.sessionManager.getBranch();
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const e = branch[i];
+			if (e.type === "custom" && e.customType === DIARY_STATE_ENTRY_TYPE) {
+				return { ...EMPTY_DIARY_WINDOW, ...(e.data as Partial<DiaryWindowState>) };
+			}
+		}
+		return { ...EMPTY_DIARY_WINDOW };
+	}
+
+	/** Append one entry to <project>/<diary dir>/<YYYY-MM-DD>-<user>.md (no auto-commit). */
+	function appendDiaryEntry(ctx: ExtensionContext, startTs: number, flushTs: number, bullets: string): void {
+		const dir = join(ctx.cwd, config.diary.dir);
+		const file = join(dir, `${localDate(new Date())}-${diaryUserName(ctx.cwd)}.md`);
+		mkdirSync(dir, { recursive: true });
+		const header = `## ${localDate(new Date(startTs))} ${localTime(new Date(startTs))}–${localTime(new Date(flushTs))} (${diaryUserName(ctx.cwd)})\n`;
+		appendFileSync(file, `${header}${bullets.trim()}\n\n`);
+	}
+
+	/** One diary flush: secondary-model call over the raw window → append entry (SPEC §5.7). */
+	async function runDiaryFlush(ctx: ExtensionContext, job: Extract<QueuedJob, { kind: "diary" }>): Promise<boolean> {
+		const model = resolveSecondaryModel(ctx);
+		if (!model) return false;
+		try {
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{
+					systemPrompt: DIARY_PROMPT,
+					messages: [
+						{
+							role: "user" as const,
+							content: [
+								{
+									type: "text" as const,
+									text: `Conversation excerpt (window ${localDate(new Date(job.windowStartTs))} ${localTime(new Date(job.windowStartTs))}–${localTime(new Date(job.flushTs))}):\n${job.text}`,
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7() },
+			);
+			const bullets = extractText(response).trim();
+			if (!bullets) return false;
+			appendDiaryEntry(ctx, job.windowStartTs, job.flushTs, bullets);
+			// Window is written — reset it (keep the coverage marker at the flushed position).
+			diaryWindow = { windowStartTs: 0, pendingDeltas: "", lastCoveredEntryId: job.entryId || diaryWindow.lastCoveredEntryId };
+			persistDiaryWindow(ctx);
+			console.error("[contextRoller] diary entry written");
+			return true;
+		} catch (err) {
+			console.error("[contextRoller] diary flush failed:", err instanceof Error ? err.message : err);
+			return false;
+		}
+	}
+
+	/** Enqueue a diary flush for the current window (no-op when empty) and ensure the pump runs. */
+	function flushDiaryWindow(ctx: ExtensionContext): void {
+		if (!diaryWindow.pendingDeltas.trim()) return;
+		queue.push({
+			kind: "diary",
+			text: diaryWindow.pendingDeltas,
+			windowStartTs: diaryWindow.windowStartTs || Date.now(),
+			flushTs: Date.now(),
+			entryId: diaryWindow.lastCoveredEntryId ?? "",
+		});
+		startPump(ctx);
+	}
+
 	async function doPump(ctx: ExtensionContext): Promise<void> {
 		while (queue.length > 0) {
 			if (!resolveSecondaryModel(ctx)) break; // unresolvable ref — retry once config/model changes
 			const item = queue.shift()!;
 			if (ctx.hasUI) ctx.ui.setStatus("contextRoller", "updating…");
-			const ok = await runSummaryUpdate(ctx, item);
+			const ok = item.kind === "summary" ? await runSummaryUpdate(ctx, item) : await runDiaryFlush(ctx, item);
 			if (!ok) {
 				queue.unshift(item); // retry on the next turn
 				break;
@@ -379,8 +516,9 @@ export default function (pi: ExtensionAPI) {
 		config = loaded.config;
 		modelSourcePath = loaded.modelSourcePath;
 		state = restoreState(ctx);
+		diaryWindow = restoreDiaryWindow(ctx);
 		console.error(
-			`[contextRoller] loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"})`,
+			`[contextRoller] loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"}, diary window: ${diaryWindow.pendingDeltas.trim() ? "pending" : "empty"})`,
 		);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("contextRoller", statusText());
@@ -393,13 +531,35 @@ export default function (pi: ExtensionAPI) {
 		if (messages.length === 0) return; // aborted/empty turn — nothing to record
 		const delta = serializeConversation(convertToLlm(messages));
 		if (!delta.trim()) return;
-		queue.push({ text: delta, entryId: ctx.sessionManager.getLeafId() ?? "" });
+		const leafId = ctx.sessionManager.getLeafId() ?? "";
+		queue.push({ kind: "summary", text: delta, entryId: leafId });
+
+		// Use Case 2 (FR-6): the same raw delta feeds the diary window (SPEC §5.7).
+		if (config.diary.enabled) {
+			diaryWindow.pendingDeltas += `\n${delta}`;
+			if (!diaryWindow.windowStartTs) diaryWindow.windowStartTs = Date.now();
+			diaryWindow.lastCoveredEntryId = leafId || diaryWindow.lastCoveredEntryId;
+			persistDiaryWindow(ctx);
+			const ageMs = Date.now() - diaryWindow.windowStartTs;
+			if (ageMs >= config.diary.intervalMinutes * 60_000) flushDiaryWindow(ctx); // interval trigger
+		}
+
 		while (queue.length > MAX_QUEUE) queue.shift();
 		startPump(ctx);
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const instructions = event.customInstructions?.trim() ?? "";
+
+		// Diary: a compaction rollover is a flush trigger (SPEC §5.7) — record the
+		// window before the context rolls over, for our compaction and native alike.
+		// The note makes the entry itself mention the rollover.
+		if (config.diary.enabled && config.model && diaryWindow.pendingDeltas.trim()) {
+			diaryWindow.pendingDeltas += `\n[Note: pi rolled over (compacted) the conversation context at this point.]`;
+			persistDiaryWindow(ctx);
+			flushDiaryWindow(ctx);
+			if (activePump) await activePump;
+		}
 
 		// "/compact native …" → let pi run its built-in compaction (SPEC §5.3).
 		if (instructions.toLowerCase().startsWith("native")) return undefined;
@@ -498,8 +658,12 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("session_shutdown", async (_event, _ctx) => {
-		// TODO(diary): flush the pending diary window — SPEC §5.7.
+	pi.on("session_shutdown", async (_event, ctx) => {
+		// Diary: flush the pending window so nothing is lost (SPEC §5.7).
+		if (config.diary.enabled && config.model && diaryWindow.pendingDeltas.trim()) {
+			flushDiaryWindow(ctx);
+			if (activePump) await activePump;
+		}
 	});
 
 	/**
@@ -589,11 +753,16 @@ export default function (pi: ExtensionAPI) {
 	 * manually (main-screen mode renders components without the flex layout
 	 * engine, so pi-tui's ScrollView would not get a viewport there).
 	 */
-	async function showSummaryViewer(ctx: ExtensionCommandContext): Promise<void> {
+	async function showMarkdownOverlay(
+		ctx: ExtensionCommandContext,
+		title: string,
+		metaParts: (string | undefined)[],
+		docText: string,
+	): Promise<void> {
 		if (ctx.mode !== "tui") return; // non-TUI callers keep the notify fallback
 		await ctx.ui.custom(
 			(tui, theme, _kb, done) => {
-				const md = new Markdown(state.summaryText, 1, 0, getMarkdownTheme());
+				const md = new Markdown(docText, 1, 0, getMarkdownTheme());
 				const topBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 				const bottomBorder = new DynamicBorder((s: string) => theme.fg("accent", s));
 				let scrollTop = 0;
@@ -616,18 +785,12 @@ export default function (pi: ExtensionAPI) {
 					return docLines.slice(scrollTop, scrollTop + viewH);
 				};
 
-				const meta = [
-					`~${estimateTextTokens(state.summaryText)} tokens`,
-					config.maxSummaryTokens > 0 ? `budget ${config.maxSummaryTokens}` : undefined,
-					state.updatedAt ? `updated ${new Date(state.updatedAt).toLocaleTimeString()}` : undefined,
-				]
-					.filter((part): part is string => part !== undefined)
-					.join(" · ");
+				const meta = metaParts.filter((part): part is string => part !== undefined).join(" · ");
 
 				return {
 					render: (width: number) => [
 						...topBorder.render(width),
-						` ${theme.fg("accent", theme.bold("contextRoller — rolling summary"))}`,
+						` ${theme.fg("accent", theme.bold(title))}`,
 						` ${theme.fg("dim", meta)}`,
 						...renderDoc(width),
 						` ${theme.fg("dim", "↑↓ scroll · PgUp/PgDn page · Home/End jump · q/Enter/Esc close")}`,
@@ -654,6 +817,20 @@ export default function (pi: ExtensionAPI) {
 				};
 			},
 			{ overlay: true, overlayOptions: { anchor: "center", margin: 2, width: "90%" } },
+		);
+	}
+
+	/** FR-7: scrollable Markdown viewer for the rolling summary with token count. */
+	async function showSummaryViewer(ctx: ExtensionCommandContext): Promise<void> {
+		await showMarkdownOverlay(
+			ctx,
+			"contextRoller — rolling summary",
+			[
+				`~${estimateTextTokens(state.summaryText)} tokens`,
+				config.maxSummaryTokens > 0 ? `budget ${config.maxSummaryTokens}` : undefined,
+				state.updatedAt ? `updated ${new Date(state.updatedAt).toLocaleTimeString()}` : undefined,
+			],
+			state.summaryText,
 		);
 	}
 
@@ -689,13 +866,36 @@ export default function (pi: ExtensionAPI) {
 					await showSummaryViewer(ctx);
 					break;
 				}
-				case "diary":
-					// TODO(diary): show today's diary tail / flush now — SPEC §5.7.
-					ctx.ui.notify(
-						arg === "now" ? "not implemented yet (TODO: diary flush)" : "not implemented yet (TODO: project diary)",
-						"warning",
-					);
+				case "diary": {
+					if (!config.diary.enabled) {
+						ctx.ui.notify("contextRoller: diary is disabled in config", "warning");
+						break;
+					}
+					if (arg === "now") {
+						flushDiaryWindow(ctx);
+						while (activePump) await activePump;
+						const pending = diaryWindow.pendingDeltas.trim().length > 0;
+						ctx.ui.notify(
+							pending
+								? "contextRoller: diary flush still pending (secondary model unavailable?)"
+								: "contextRoller: diary flushed",
+							pending ? "warning" : "info",
+						);
+						break;
+					}
+					const file = join(ctx.cwd, config.diary.dir, `${localDate(new Date())}-${diaryUserName(ctx.cwd)}.md`);
+					if (!existsSync(file)) {
+						ctx.ui.notify("contextRoller: no diary entries today yet", "info");
+						break;
+					}
+					const content = readFileSync(file, "utf8").trim();
+					if (ctx.mode !== "tui") {
+						ctx.ui.notify(content, "info");
+						break;
+					}
+					await showMarkdownOverlay(ctx, `contextRoller — diary ${localDate(new Date())}`, [file], content);
 					break;
+				}
 				default:
 					ctx.ui.notify("Usage: /contextRoller [model | now | show | diary [now]]", "error");
 			}

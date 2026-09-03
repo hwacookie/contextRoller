@@ -38,4 +38,4 @@ Long-running sessions with large-context models eventually hit the context limit
 
 ## Status
 
-Design complete — see [SPEC.md](SPEC.md). Implementation in progress.
+Both use cases implemented and verified end-to-end — see [SPEC.md](SPEC.md) (incl. §8 status checklist).
