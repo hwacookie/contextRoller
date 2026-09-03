@@ -64,6 +64,7 @@ The same per-turn delta stream feeds a second consumer: an automatic **project d
 * **FR-4:** On context saturation, reduce the active context to system prompt + rolling summary (+ configurable kept entries) — no session replacement.
 * **FR-5:** Provide a `/contextRoller` command to select the secondary model via a fuzzy-search picker over pi's live model registry, without changing the session's active (main) model. Persist the selection.
 * **FR-6:** Maintain an append-only project diary: in activity windows (default 15 minutes), summarize what was worked on, what was completed, and what was tried and discarded (with reasons) — generated from the raw turn deltas, not from the rolling summary. Entries carry date + timestamps; files are per-day, per-user at `<project>/diary/<YYYY-MM-DD>-<user>.md`, plain markdown, committed via the user's normal git workflow (no auto-commit). Diary content never enters LLM context.
+* **FR-7:** The maximum size of the rolling summary is user-configurable in tokens (`maxSummaryTokens`, default 4096; `0` disables the budget). Enforcement: the budget is stated in the secondary model's prompt; after each update, if the estimated token count exceeds the budget, one compression call to the secondary model regenerates a fitting document (same structure); at compaction handoff, an over-budget summary is compressed once, falling back to using it as-is on failure (never block the session — NFR-4).
 
 ### Non-Functional Requirements
 
@@ -109,6 +110,7 @@ The original conceptual draft (§7 of the v0 spec) assumed hook names and APIs t
 * Deltas are appended to a FIFO queue; a single sequential worker processes them (the draft's mutex idea, generalized so updates are never dropped or interleaved).
 * Each item: `ctx.modelRegistry.complete(secondaryModel, { systemPrompt: ROLLING_SUMMARY_PROMPT, messages: [{ role: "user", content: "Current state:\n…\n\nLatest interaction:\n…" }] }, { maxTokens, signal?, cacheRetention: "none", sessionId: uuidv7() })`.
 * On success: update `state.summaryText`, advance coverage marker (see 5.2), persist via `pi.appendEntry`, refresh footer status.
+* Budget enforcement (FR-7): the prompt states the configured token budget; after each successful update, if `estimateTokens(summaryText)` (exported from pi) exceeds it, one additional compression call to the secondary model regenerates a fitting document. Compression failure keeps the current summary.
 * On failure: keep previous summary, log + throttled notify; next turn retries naturally.
 
 ### 5.2 State & persistence
@@ -148,6 +150,7 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 * Keep policy: config `keepLastEntries` (default `0`). `0` → a non-matching id (keeps nothing); `n > 0` → id of the branch entry `n` positions before the end. Rationale for default 0: the rolling summary is designed to stand alone; keeping 20k tokens would reintroduce the "high initial load" problem (NFR-3).
 * Works for all three reasons (`manual`, `threshold`, `overflow`); on overflow with `willRetry`, the retried turn runs against system prompt + summary.
+* Budget guarantee (FR-7): if the summary still exceeds `maxSummaryTokens` at handoff, one compression call with `event.signal`; on failure the summary is used as-is (NFR-4).
 
 ### 5.4 `/contextRoller` command
 
@@ -156,11 +159,13 @@ pi.on("session_before_compact", async (event, ctx) => {
 | `/contextRoller` | Status: secondary model, last update time, queue depth, summary size |
 | `/contextRoller model` | Fuzzy picker (below) → persist `provider/modelId` to config |
 | `/contextRoller now` | Force an immediate catch-up update |
-| `/contextRoller show` | Display the current rolling summary |
+| `/contextRoller show` | Open the current rolling summary in a scrollable Markdown viewer, with token estimate vs budget and last-update time |
 | `/contextRoller diary` | Show the tail of today's diary file |
 | `/contextRoller diary now` | Flush the current diary window immediately |
 
 **Fuzzy picker** (`/contextRoller model`): custom TUI component via `ctx.ui.custom()` built from public pi-tui exports — `Input` (search box, focused first) + `SelectList`, filtered with `fuzzyFilter(models, query, m => \`${m.provider}/${m.id}\`)`. Data source: `ctx.modelRegistry.getAvailable()` (live session registry → full parity with `/model`). Enter selects, Esc cancels. The selected model is resolved later via `ctx.modelRegistry.find(provider, id)`; unresolvable at `session_start` → notify + native-compaction fallback.
+
+**Show viewer** (`/contextRoller show`): `ctx.ui.custom()` with a Markdown component plus a header line (token estimate vs budget, last update time); Esc closes. Non-TUI modes fall back to plain-text output.
 
 ### 5.5 Configuration
 
@@ -171,6 +176,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   "model": "ollama/qwen2.5-3b-instruct",
   "keepLastEntries": 0,
   "maxOutputTokens": 2048,
+  "maxSummaryTokens": 4096,
   "diary": { "enabled": true, "intervalMinutes": 15, "dir": "diary" }
 }
 ```
@@ -412,6 +418,7 @@ export default function (pi: ExtensionAPI) {
 
 ### TODO
 - [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down)
+- [ ] Token budget (FR-7): `maxSummaryTokens` config, prompt + per-update compression pass, handoff guarantee; upgrade `/contextRoller show` to a Markdown viewer with token count
 - [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
 - [ ] Local server registration via `models.json`; end-to-end test: long session → compaction → context ≈ system prompt + summary
 - [ ] Project diary: windowing, flush triggers, per-day/per-user files under `<project>/diary/`; verify entries survive restarts, capture discarded approaches, and never enter LLM context
