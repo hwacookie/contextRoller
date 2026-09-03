@@ -4,7 +4,7 @@
   "maxOutputTokens": 2048,
   "diary": {
     "enabled": true,
-    "intervalMinutes": 15,
+    "maxWindowMinutes": 60,
     "dir": "diary"
   }
 }

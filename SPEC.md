@@ -63,7 +63,7 @@ The same per-turn delta stream feeds a second consumer: an automatic **project d
 * **FR-3:** Intercept the native Pi context compaction lifecycle event (`session_before_compact`) and supply the precomputed summary as a custom compaction.
 * **FR-4:** On context saturation, reduce the active context to system prompt + rolling summary (+ configurable kept entries) — no session replacement.
 * **FR-5:** Provide a `/contextRoller` command to select the secondary model via a fuzzy-search picker over pi's live model registry, without changing the session's active (main) model. Persist the selection.
-* **FR-6:** Maintain an append-only project diary: in activity windows (default 15 minutes), summarize what was worked on, what was completed, and what was tried and discarded (with reasons) — generated from the raw turn deltas, not from the rolling summary. Entries carry date + timestamps; files are per-day, per-user at `<project>/diary/<YYYY-MM-DD>-<user>.md`, plain markdown, committed via the user's normal git workflow (no auto-commit). Diary content never enters LLM context.
+* **FR-6:** Maintain an append-only project diary: when the secondary model judges that a meaningful event happened (task completed, important decision, approach tried and discarded, significant state change), summarize what was worked on, what was completed, and what was tried and discarded (with reasons) — generated from the raw turn deltas, not from the rolling summary. Entries carry date + timestamps; files are per-day, per-user at `<project>/diary/<YYYY-MM-DD>-<user>.md`, plain markdown, committed via the user's normal git workflow (no auto-commit). Diary content never enters LLM context.
 * **FR-7:** The maximum size of the rolling summary is user-configurable in tokens (`maxSummaryTokens`, default 4096; `0` disables the budget). Enforcement: the budget is stated in the secondary model's prompt; after each update, if the estimated token count exceeds the budget, one compression call to the secondary model regenerates a fitting document (same structure); at compaction handoff, an over-budget summary is compressed once, falling back to using it as-is on failure (never block the session — NFR-4).
 
 ### Non-Functional Requirements
@@ -186,7 +186,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   "keepLastEntries": 0,
   "maxOutputTokens": 2048,
   "maxSummaryTokens": 4096,
-  "diary": { "enabled": true, "intervalMinutes": 15, "dir": "diary" }
+  "diary": { "enabled": true, "maxWindowMinutes": 60, "dir": "diary" }
 }
 ```
 
@@ -199,12 +199,14 @@ pi.on("session_before_compact", async (event, ctx) => {
 
 **Rationale.** The rolling summary is *convergent* memory: it must overwrite dead ends, otherwise it pollutes the context with things that no longer exist. The diary is *divergent* (episodic) memory: append-only, never overwritten. "We tried X and discarded it because Y" is useless for continuing to code — but valuable for not repeating mistakes and for later understanding why we are at approach Z. Both consumers read the same `turn_end` delta stream through the same sequential worker.
 
-**Windowing & flush triggers.** Deltas since the last diary entry accumulate in a buffer. A window is flushed (one secondary-model call → one entry) when any of:
+**Windowing & flush triggers.** Deltas since the last diary entry accumulate in a buffer. Entries are **judgment-based, not time-based**: no fixed interval drives them.
 
-* the window is ≥ `diary.intervalMinutes` old (default 15) *and* contains new content — checked on each `turn_end` (no persistent timer needed);
-* `session_shutdown` / reload fires (nothing is lost);
-* a compaction rollover occurs (the diary then also records the context rollover);
-* manually via `/contextRoller diary now`.
+* *Judgment (primary):* every per-turn summary update already calls the secondary model; the same call ends with a diary judgment — the model outputs `<diary>write</diary>` when the latest interaction contains a diary-worthy event (task/milestone completed, important decision made, approach tried and discarded or failed, significant state change incl. a context rollover), else `<diary>skip</diary>`. On `write`, one extra call formats the pending window into an entry; on `skip`, the content stays pending and is folded into the next entry. Zero extra model calls for skipped turns.
+* *Safety net:* a non-empty window older than `diary.maxWindowMinutes` (default 60, `0` = judgment only) is flushed anyway at the next `turn_end` — bounds window growth in long sessions without meaningful events.
+* *Terminal:* `session_shutdown` / reload force-flushes the pending window (nothing is lost).
+* *Manual:* `/contextRoller diary now` force-flushes immediately.
+
+**Compaction rollover.** No forced entry at compaction time — that would reintroduce block-based entries. Instead the hook appends a rollover note to the pending window (even an empty one), so the next entry covering that point records the rollover; if a catch-up summary call runs as part of the compaction, its judgment applies immediately.
 
 Known limitation: flushes happen at turn boundaries — a 40-minute build delays its entry until it completes.
 
@@ -429,7 +431,8 @@ export default function (pi: ExtensionAPI) {
 - [x] Local server registration via `models.json`; end-to-end RPC test: three compactions in one session against the local secondary model
 - [x] `/contextRoller show`: scrollable Markdown viewer overlay with token count + budget + last update (FR-7); manual viewport clipping (main-screen mode renders without the flex layout engine, so pi-tui's ScrollView would not get a viewport there); verified in a real TUI session
 - [x] `/contextRoller` command: status | model | now | show all implemented. `model` is a fuzzy picker (`Input` + `SelectList` + `fuzzyFilter`) over the live registry `getAvailable()` (full `/model` parity); provider shown in the description column because display names are not unique across providers; selection persists to the config file that provided `model` (project file if unset); main model never touched (no `setModel` call anywhere). Verified in a real TUI session incl. filter, select, persist, and main-model-untouched
-- [x] Project diary (FR-6, §5.7): raw-delta windowing persisted as a `diary-window` custom entry (survives restarts), flush triggers — interval at `turn_end`, compaction rollover (manual *and* automatic; the entry itself records the rollover via a note appended to the window), `session_shutdown`, and manual `/contextRoller diary now`; per-day/per-user files `<project>/diary/<YYYY-MM-DD>-<user>.md` with user from sanitized `git config user.name`; secondary-model bullets (Worked on / Done / Tried & discarded / State) under a deterministic code-assembled header; `/contextRoller diary` shows today's file in the shared Markdown overlay. Verified end-to-end via RPC + PTY: manual flush, restart round-trip (SIGKILL → `diary window: pending` restored → flush covers pre-restart work), graceful-shutdown flush (SIGTERM), dead-end capture (real abandoned approach produced a `Tried & discarded` line with reason), and rollover recording through a genuine automatic threshold compaction. Diary content is file-only — it never enters LLM context by construction
+- [x] Project diary (FR-6, §5.7): raw-delta windowing persisted as a `diary-window` custom entry (survives restarts); per-day/per-user files `<project>/diary/<YYYY-MM-DD>-<user>.md` with user from sanitized `git config user.name`; secondary-model bullets (Worked on / Done / Tried & discarded / State) under a deterministic code-assembled header; `/contextRoller diary` shows today's file in the shared Markdown overlay. Verified end-to-end via RPC + PTY: manual flush, restart round-trip (SIGKILL → `diary window: pending` restored → flush covers pre-restart work), graceful-shutdown flush (SIGTERM), dead-end capture (real abandoned approach produced a `Tried & discarded` line with reason), and rollover recording. Diary content is file-only — it never enters LLM context by construction
+- [x] Judgment-based diary entries (§5.7): the fixed 15-minute interval is gone. The per-turn summary call now ends with a `<diary>write|skip</diary>` marker (zero extra model calls for skips); `write` triggers one formatting call over the pending window, `skip` folds the content into the next entry. Compaction no longer force-flushes — it appends a rollover note to the window (even an empty one) so the next covering entry records it. `maxWindowMinutes` (default 60, `0` = judgment only) is a safety net bounding window growth; `session_shutdown` and `/contextRoller diary now` remain force-flushes. Verified via RPC: boring turn → skip (no entry), meaningful turn → exactly one entry covering the window with no marker residue in the summary, manual compaction → note-only rollover recorded by the next judged entry ("rollover checkpoint reached with context compaction"), and the cap forcing a flush of an aged boring window
 
 ### TODO
 - (none)

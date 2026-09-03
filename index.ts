@@ -40,7 +40,8 @@ import { fuzzyFilter, Input, Markdown, matchesKey, SelectList } from "@earendil-
 
 interface DiaryConfig {
 	enabled: boolean;
-	intervalMinutes: number;
+	/** Safety net: force-flush a non-empty window older than this (minutes; 0 = judgment only). */
+	maxWindowMinutes: number;
 	dir: string;
 }
 
@@ -60,7 +61,7 @@ const DEFAULT_CONFIG: ContextRollerConfig = {
 	keepLastEntries: 0,
 	maxOutputTokens: 2048,
 	maxSummaryTokens: 4096,
-	diary: { enabled: true, intervalMinutes: 15, dir: "diary" },
+	diary: { enabled: true, maxWindowMinutes: 60, dir: "diary" },
 };
 
 /** Load config: global (~/.pi/agent) first, project (.pi/) overrides. */
@@ -234,7 +235,24 @@ Rules:
 
 <modified-files>
 ...
-</modified-files>`;
+</modified-files>
+
+Diary judgment — final line of your response:
+A project diary records meaningful events only. As the very last line of your response, output exactly one of these two markers:
+- <diary>write</diary> — if the latest interaction contains a diary-worthy event: a task or milestone completed, an important decision made, an approach tried and discarded or failed, or a significant state change (including a note that the conversation context was compacted).
+- <diary>skip</diary> — otherwise (incremental progress on ongoing work, plain questions and answers, small follow-ups). Skipped content is folded into the next diary entry.`;
+
+/**
+ * Extract the diary judgment marker from a model response (SPEC §5.7).
+ * Last occurrence wins; missing/malformed markers default to skip.
+ */
+function parseDiaryMarker(raw: string): { text: string; diaryWrite: boolean } {
+	let diaryWrite = false;
+	const markerRe = /<diary>\s*(write|skip)\s*<\/diary>/gi;
+	let m: RegExpExecArray | null;
+	while ((m = markerRe.exec(raw)) !== null) diaryWrite = m[1].toLowerCase() === "write";
+	return { text: raw.replace(/<diary>\s*\w+\s*<\/diary>\s*/g, "").trim(), diaryWrite };
+}
 
 /** Jobs processed sequentially by the pump (one secondary-model call each). */
 type QueuedJob =
@@ -252,6 +270,9 @@ type QueuedJob =
 			flushTs: number;
 			entryId: string;
 	  };
+
+/** Result of a summary job: success plus the diary judgment from the same call (SPEC §5.7). */
+type SummaryResult = { ok: false } | { ok: true; diaryWrite: boolean };
 
 const MAX_QUEUE = 50; // cap memory if the secondary server is down for a long time
 
@@ -324,9 +345,9 @@ export default function (pi: ExtensionAPI) {
 		ctx: ExtensionContext,
 		delta: { text: string; entryId: string },
 		signal?: AbortSignal,
-	): Promise<boolean> {
+	): Promise<SummaryResult> {
 		const model = resolveSecondaryModel(ctx);
-		if (!model) return false;
+		if (!model) return { ok: false };
 		try {
 			const response = await ctx.modelRegistry.complete(
 				model,
@@ -347,10 +368,10 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7(), signal },
 			);
-			const text = extractText(response);
-			if (!text.trim()) return false;
+			const { text, diaryWrite } = parseDiaryMarker(extractText(response));
+			if (!text) return { ok: false };
 			state = {
-				summaryText: text.trim(),
+				summaryText: text,
 				lastCoveredEntryId: delta.entryId || state.lastCoveredEntryId,
 				updatedAt: Date.now(),
 			};
@@ -360,10 +381,10 @@ export default function (pi: ExtensionAPI) {
 			if (config.maxSummaryTokens > 0 && estimateTextTokens(state.summaryText) > config.maxSummaryTokens) {
 				await compressSummary(ctx);
 			}
-			return true;
+			return { ok: true, diaryWrite };
 		} catch (err) {
 			console.error("[contextRoller] summary update failed:", err instanceof Error ? err.message : err);
-			return false;
+			return { ok: false };
 		}
 	}
 
@@ -479,10 +500,33 @@ export default function (pi: ExtensionAPI) {
 			if (!resolveSecondaryModel(ctx)) break; // unresolvable ref — retry once config/model changes
 			const item = queue.shift()!;
 			if (ctx.hasUI) ctx.ui.setStatus("contextRoller", "updating…");
-			const ok = item.kind === "summary" ? await runSummaryUpdate(ctx, item) : await runDiaryFlush(ctx, item);
-			if (!ok) {
-				queue.unshift(item); // retry on the next turn
-				break;
+			if (item.kind === "summary") {
+				const res = await runSummaryUpdate(ctx, item);
+				if (!res.ok) {
+					queue.unshift(item); // retry on the next turn
+					break;
+				}
+				// Diary judgment from the same call (SPEC §5.7): when the model judged the
+				// turn diary-worthy, format + append the pending window (one extra call).
+				if (res.diaryWrite && config.diary.enabled && diaryWindow.pendingDeltas.trim()) {
+					const djob: QueuedJob = {
+						kind: "diary",
+						text: diaryWindow.pendingDeltas,
+						windowStartTs: diaryWindow.windowStartTs || Date.now(),
+						flushTs: Date.now(),
+						entryId: diaryWindow.lastCoveredEntryId ?? "",
+					};
+					if (!(await runDiaryFlush(ctx, djob))) {
+						queue.unshift(djob); // retry the diary job on the next pump cycle
+						break;
+					}
+					}
+			} else {
+				const ok = await runDiaryFlush(ctx, item);
+				if (!ok) {
+					queue.unshift(item); // retry on the next turn
+					break;
+				}
 			}
 		}
 		if (ctx.hasUI) ctx.ui.setStatus("contextRoller", statusText());
@@ -541,7 +585,8 @@ export default function (pi: ExtensionAPI) {
 			diaryWindow.lastCoveredEntryId = leafId || diaryWindow.lastCoveredEntryId;
 			persistDiaryWindow(ctx);
 			const ageMs = Date.now() - diaryWindow.windowStartTs;
-			if (ageMs >= config.diary.intervalMinutes * 60_000) flushDiaryWindow(ctx); // interval trigger
+			// Safety net only (SPEC §5.7): bounds window growth when nothing diary-worthy happens.
+			if (config.diary.maxWindowMinutes > 0 && ageMs >= config.diary.maxWindowMinutes * 60_000) flushDiaryWindow(ctx);
 		}
 
 		while (queue.length > MAX_QUEUE) queue.shift();
@@ -551,14 +596,14 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const instructions = event.customInstructions?.trim() ?? "";
 
-		// Diary: a compaction rollover is a flush trigger (SPEC §5.7) — record the
-		// window before the context rolls over, for our compaction and native alike.
-		// The note makes the entry itself mention the rollover.
-		if (config.diary.enabled && config.model && diaryWindow.pendingDeltas.trim()) {
+		// Diary: mark the rollover in the pending window (SPEC §5.7). No forced flush —
+		// entries are written when the model judges something diary-worthy happened; the
+		// note (kept even in a previously empty window) makes sure the next entry that
+		// covers this point mentions the rollover.
+		if (config.diary.enabled && config.model) {
 			diaryWindow.pendingDeltas += `\n[Note: pi rolled over (compacted) the conversation context at this point.]`;
+			if (!diaryWindow.windowStartTs) diaryWindow.windowStartTs = Date.now();
 			persistDiaryWindow(ctx);
-			flushDiaryWindow(ctx);
-			if (activePump) await activePump;
 		}
 
 		// "/compact native …" → let pi run its built-in compaction (SPEC §5.3).
@@ -589,8 +634,13 @@ export default function (pi: ExtensionAPI) {
 			const delta = serializeConversation(convertToLlm(substantive));
 			const lastMessageEntry = [...tail].reverse().find((e) => e.type === "message");
 			console.error(`[contextRoller] compaction catch-up: ${substantive.length} uncovered entries`);
-			const ok = await runSummaryUpdate(ctx, { text: delta, entryId: lastMessageEntry?.id ?? "" }, event.signal);
-			if (!ok) return undefined; // NFR-4: native fallback
+			const res = await runSummaryUpdate(ctx, { text: delta, entryId: lastMessageEntry?.id ?? "" }, event.signal);
+			if (!res.ok) return undefined; // NFR-4: native fallback
+			// Diary judgment at rollover (SPEC §5.7): the window carries the rollover note.
+			if (res.diaryWrite && config.diary.enabled && diaryWindow.pendingDeltas.trim()) {
+				flushDiaryWindow(ctx);
+				if (activePump) await activePump;
+			}
 		} else if (uncovered.length > 0) {
 			// Only substance-less entries (e.g. aborted messages) — advance the coverage
 			// marker without an LLM call so we don't re-check them next time.
@@ -635,9 +685,10 @@ export default function (pi: ExtensionAPI) {
 						},
 						{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7(), signal: event.signal },
 					);
-					const text = extractText(response);
-					if (text.trim()) {
-						summary = text.trim();
+					// Strip the diary marker — this pass must output only the document.
+					const text = parseDiaryMarker(extractText(response)).text;
+					if (text) {
+						summary = text;
 						applied = true;
 					}
 				} catch (err) {

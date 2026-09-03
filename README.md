@@ -17,7 +17,7 @@ Long-running sessions with large-context models eventually hit the context limit
 
 **2. Project diary**
 
-- Every ~15 minutes of activity, a short timestamped entry is appended to `diary/<YYYY-MM-DD>-<user>.md` in the project root: what was worked on, what was completed, and — unlike the rolling summary — what was *tried and discarded* (with reasons).
+- When something meaningful happens — a task completed, an important decision, an approach tried and discarded — the secondary model says so in its regular per-turn summary call, and a short timestamped entry is appended to `diary/<YYYY-MM-DD>-<user>.md` in the project root: what was worked on, what was completed, and — unlike the rolling summary — what was *tried and discarded* (with reasons). Boring turns are skipped at zero extra model cost and fold into the next entry.
 - Plain markdown, one file per day per user, meant to be committed with your normal git workflow.
 
 ## Commands
