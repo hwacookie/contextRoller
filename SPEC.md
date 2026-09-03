@@ -400,11 +400,19 @@ export default function (pi: ExtensionAPI) {
 
 ---
 
-## 8. Next Steps for Development
+## 8. Status
 
-1. Scaffold the extension in this repo (`index.ts` + `package.json` if needed) and load with `pi -e ./index.ts`.
-2. Implement background worker + persistence; verify `turn_end` deltas and `appendEntry` round-trip across `/reload` and restart.
-3. Implement `session_before_compact` interception; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down).
-4. Implement `/contextRoller` incl. fuzzy picker over `getAvailable()`; verify main model is untouched after selection.
-5. Add `models.json` snippet for the chosen local server; end-to-end test: long session → compaction → context ≈ system prompt + summary.
-6. Implement the project diary (windowing, flush triggers, per-day/per-user files under `<project>/diary/`); verify entries survive restarts, include discarded-approach details, and never enter LLM context.
+### Done
+
+- [x] API verification against pi 0.84.3 (hook names, custom compaction semantics, model registry — see §4)
+- [x] Use case 2 (project diary) specified (§5.7, FR-6)
+- [x] Public GitHub repository, README, English-only documentation rule (AGENTS.md)
+
+### TODO
+
+- [ ] Scaffold the extension in this repo (`index.ts` + `package.json` if needed); load with `pi -e ./index.ts`
+- [ ] Background worker: `turn_end` deltas, FIFO queue, persistence via `appendEntry`; verify round-trip across `/reload` and restart
+- [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down)
+- [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
+- [ ] Local server registration via `models.json`; end-to-end test: long session → compaction → context ≈ system prompt + summary
+- [ ] Project diary: windowing, flush triggers, per-day/per-user files under `<project>/diary/`; verify entries survive restarts, capture discarded approaches, and never enter LLM context
