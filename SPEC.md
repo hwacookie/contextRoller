@@ -152,6 +152,14 @@ pi.on("session_before_compact", async (event, ctx) => {
 * Works for all three reasons (`manual`, `threshold`, `overflow`); on overflow with `willRetry`, the retried turn runs against system prompt + summary.
 * Budget guarantee (FR-7): if the summary still exceeds `maxSummaryTokens` at handoff, one compression call with `event.signal`; on failure the summary is used as-is (NFR-4).
 
+**Manual instructions (`/compact [text]`).** The TUI parses `/compact` before any extension event (verified: built-in command checks in `interactive-mode.js` run ahead of the extension `input` pipeline), so the hook cannot rewrite what pi sees — it only observes `event.customInstructions`:
+
+| Invocation | Behavior |
+|---|---|
+| `/compact` | Fast path: inject the rolling summary, no LLM call. |
+| `/compact native [rest]` | Return `undefined` → pi runs **native** compaction. The keyword cannot be stripped (see above); the native summarizer receives `"native [rest]"` as instructions — the leading word is harmless noise. |
+| `/compact <instructions>` (anything else) | Our compaction **plus one extra secondary-model pass**: the current rolling summary (after catch-up) is regenerated with the user's instructions appended to the prompt (e.g. `in Spanish`, `caveman speech`). If that call fails, inject the plain rolling summary and notify a warning. |
+
 ### 5.4 `/contextRoller` command
 
 | Invocation | Action |
@@ -417,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 - [x] Background worker: `turn_end` deltas, FIFO queue with sequential pump, persistence via `appendEntry`; verified end-to-end against a local model (Unsloth Studio) incl. restart round-trip (`summary: restored`)
 
 ### TODO
-- [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down)
+- [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down); handle `/compact native …` passthrough and the `/compact <instructions>` transform pass
 - [ ] Token budget (FR-7): `maxSummaryTokens` config, prompt + per-update compression pass, handoff guarantee; upgrade `/contextRoller show` to a Markdown viewer with token count
 - [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
 - [ ] Local server registration via `models.json`; end-to-end test: long session → compaction → context ≈ system prompt + summary
