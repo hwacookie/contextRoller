@@ -8,6 +8,9 @@
  *
  * Design: SPEC.md (verified against pi 0.84.3).
  * Load for testing:  pi -e ./index.ts
+ *
+ * Note: diagnostics go to stderr (console.error) — stdout is reserved for pi's
+ * own output and the RPC protocol.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -19,9 +22,11 @@ import {
 	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
+	estimateTokens,
 	serializeConversation,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { type Model, uuidv7 } from "@earendil-works/pi-ai";
+import { type AgentMessage, type AssistantMessage, type Model, uuidv7 } from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // Configuration (SPEC §5.5)
@@ -40,12 +45,15 @@ interface ContextRollerConfig {
 	keepLastEntries: number;
 	/** Max output tokens for secondary-model calls. */
 	maxOutputTokens: number;
+	/** Max size of the rolling summary in tokens (0 = no budget, FR-7). */
+	maxSummaryTokens: number;
 	diary: DiaryConfig;
 }
 
 const DEFAULT_CONFIG: ContextRollerConfig = {
 	keepLastEntries: 0,
 	maxOutputTokens: 2048,
+	maxSummaryTokens: 4096,
 	diary: { enabled: true, intervalMinutes: 15, dir: "diary" },
 };
 
@@ -86,6 +94,9 @@ const EMPTY_STATE: RollingSummaryState = { summaryText: "", lastCoveredEntryId: 
 
 const STATE_ENTRY_TYPE = "rolling-summary";
 
+/** Non-matching firstKeptEntryId → pi keeps nothing before the compaction entry (SPEC §4 fact 2). */
+const KEEP_NONE_ID = "contextRoller-keep-none";
+
 /** Reconstruct state from the latest persisted custom entry on the branch. */
 function restoreState(ctx: ExtensionContext): RollingSummaryState {
 	const branch = ctx.sessionManager.getBranch();
@@ -104,7 +115,7 @@ function restoreState(ctx: ExtensionContext): RollingSummaryState {
 }
 
 // ---------------------------------------------------------------------------
-// Background worker (SPEC §5.1)
+// Secondary-model helpers (SPEC §5.1)
 // ---------------------------------------------------------------------------
 
 const ROLLING_SUMMARY_PROMPT = `You are a state tracking assistant for a coding agent session. You maintain a concise working-memory document that replaces summarized conversation history, so it must stand alone.
@@ -156,6 +167,35 @@ interface QueuedDelta {
 
 const MAX_QUEUE = 50; // cap memory if the secondary server is down for a long time
 
+function extractText(response: AssistantMessage): string {
+	return response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("\n");
+}
+
+/**
+ * Whether a message carries state worth recording in the rolling summary.
+ * Aborted/empty assistant messages (e.g. after a mid-stream /compact abort)
+ * must not be fed to the secondary model — they destroy the document.
+ */
+function hasSubstance(msg: AgentMessage): boolean {
+	if (msg.role === "assistant") {
+		return msg.content.some((c) => (c.type === "text" && c.text.trim() !== "") || c.type === "toolCall");
+	}
+	const content = (msg as { content?: unknown }).content;
+	if (typeof content === "string") return content.trim() !== "";
+	if (Array.isArray(content)) {
+		return content.some((c) => c?.type === "text" && typeof c.text === "string" && c.text.trim() !== "");
+	}
+	return false;
+}
+
+/** Token estimate for plain text via pi's chars/4 heuristic. */
+function estimateTextTokens(text: string): number {
+	return estimateTokens({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -175,6 +215,12 @@ export default function (pi: ExtensionAPI) {
 		return `model: ${model} | summary: ${summary} | updated: ${updated}${queued}`;
 	}
 
+	function budgetClause(): string {
+		return config.maxSummaryTokens > 0
+			? `\n\nKeep the entire document under ~${config.maxSummaryTokens} tokens.`
+			: "";
+	}
+
 	/** Resolve the configured secondary model ("provider/modelId", first slash). */
 	function resolveSecondaryModel(ctx: ExtensionContext): Model<any> | undefined {
 		const ref = config.model;
@@ -184,52 +230,97 @@ export default function (pi: ExtensionAPI) {
 		return ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
 	}
 
+	/** One rolling-summary update for a delta. Returns true on success. */
+	async function runSummaryUpdate(
+		ctx: ExtensionContext,
+		delta: { text: string; entryId: string },
+		signal?: AbortSignal,
+	): Promise<boolean> {
+		const model = resolveSecondaryModel(ctx);
+		if (!model) return false;
+		try {
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{
+					systemPrompt: ROLLING_SUMMARY_PROMPT + budgetClause(),
+					messages: [
+						{
+							role: "user" as const,
+							content: [
+								{
+									type: "text" as const,
+									text: `Current state:\n${state.summaryText || "(empty)"}\n\nLatest interaction:\n${delta.text}`,
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7(), signal },
+			);
+			const text = extractText(response);
+			if (!text.trim()) return false;
+			state = {
+				summaryText: text.trim(),
+				lastCoveredEntryId: delta.entryId || state.lastCoveredEntryId,
+				updatedAt: Date.now(),
+			};
+			pi.appendEntry(STATE_ENTRY_TYPE, state);
+			console.error(`[contextRoller] summary updated (${state.summaryText.length} chars)`);
+			// FR-7: keep the document within budget.
+			if (config.maxSummaryTokens > 0 && estimateTextTokens(state.summaryText) > config.maxSummaryTokens) {
+				await compressSummary(ctx);
+			}
+			return true;
+		} catch (err) {
+			console.error("[contextRoller] summary update failed:", err instanceof Error ? err.message : err);
+			return false;
+		}
+	}
+
+	/** FR-7: compress the current summary to fit the token budget. */
+	async function compressSummary(ctx: ExtensionContext, signal?: AbortSignal): Promise<void> {
+		const model = resolveSecondaryModel(ctx);
+		if (!model) return;
+		try {
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{
+					systemPrompt: `Compress the working-memory document provided by the user to fit under ~${config.maxSummaryTokens} tokens. Preserve the exact section structure and the most important content (goals, key decisions, in-progress work, file lists); drop verbose details first. Output only the compressed document.`,
+					messages: [
+						{
+							role: "user" as const,
+							content: [{ type: "text" as const, text: state.summaryText }],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7(), signal },
+			);
+			const text = extractText(response);
+			if (text.trim()) {
+				state = { ...state, summaryText: text.trim(), updatedAt: Date.now() };
+				pi.appendEntry(STATE_ENTRY_TYPE, state);
+				console.error(`[contextRoller] summary compressed to ${state.summaryText.length} chars`);
+			}
+		} catch (err) {
+			console.error("[contextRoller] compression failed:", err instanceof Error ? err.message : err);
+		}
+	}
+
 	async function doPump(ctx: ExtensionContext): Promise<void> {
 		while (queue.length > 0) {
-			const model = resolveSecondaryModel(ctx);
-			if (!model) break; // unresolvable ref — retry once config/model changes
+			if (!resolveSecondaryModel(ctx)) break; // unresolvable ref — retry once config/model changes
 			const item = queue.shift()!;
 			if (ctx.hasUI) ctx.ui.setStatus("contextRoller", "updating…");
-			try {
-				const response = await ctx.modelRegistry.complete(
-					model,
-					{
-						systemPrompt: ROLLING_SUMMARY_PROMPT,
-						messages: [
-							{
-								role: "user" as const,
-								content: [
-									{
-										type: "text" as const,
-										text: `Current state:\n${state.summaryText || "(empty)"}\n\nLatest interaction:\n${item.text}`,
-									},
-								],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7() },
-				);
-				const text = response.content
-					.filter((c): c is { type: "text"; text: string } => c.type === "text")
-					.map((c) => c.text)
-					.join("\n");
-				if (text.trim()) {
-					state = {
-						summaryText: text.trim(),
-						lastCoveredEntryId: item.entryId || state.lastCoveredEntryId,
-						updatedAt: Date.now(),
-					};
-					pi.appendEntry(STATE_ENTRY_TYPE, state);
-					console.log(`[contextRoller] summary updated (${state.summaryText.length} chars)`);
-				}
-			} catch (err) {
-				console.error("[contextRoller] background update failed:", err instanceof Error ? err.message : err);
+			const ok = await runSummaryUpdate(ctx, item);
+			if (!ok) {
 				queue.unshift(item); // retry on the next turn
 				break;
 			}
 		}
 		if (ctx.hasUI) ctx.ui.setStatus("contextRoller", statusText());
+		console.error("[contextRoller] idle"); // queue drained — test/diagnostic signal
 	}
 
 	function startPump(ctx: ExtensionContext): void {
@@ -239,10 +330,25 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
+	/** Entry id where kept messages start after compaction (SPEC §5.3 keep policy). */
+	function firstKeptEntryId(branch: SessionEntry[]): string {
+		const keep = config.keepLastEntries;
+		if (keep <= 0 || branch.length === 0) return KEEP_NONE_ID;
+		let idx = Math.max(0, branch.length - keep);
+		// Never start at a tool result — it must stay attached to its tool call.
+		while (idx < branch.length && !isValidCutPoint(branch[idx])) idx++;
+		return idx < branch.length ? branch[idx].id : KEEP_NONE_ID;
+	}
+
+	function isValidCutPoint(entry: SessionEntry): boolean {
+		if (entry.type === "message") return entry.message.role !== "toolResult";
+		return entry.type === "custom" || entry.type === "branch_summary";
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig(ctx.cwd);
 		state = restoreState(ctx);
-		console.log(
+		console.error(
 			`[contextRoller] loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"})`,
 		);
 		if (ctx.hasUI) {
@@ -252,18 +358,113 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (event, ctx) => {
 		if (!config.model) return; // no secondary model configured — nothing to update
-		const delta = serializeConversation(convertToLlm([event.message, ...event.toolResults]));
+		const messages = [event.message, ...event.toolResults].filter(hasSubstance);
+		if (messages.length === 0) return; // aborted/empty turn — nothing to record
+		const delta = serializeConversation(convertToLlm(messages));
 		if (!delta.trim()) return;
 		queue.push({ text: delta, entryId: ctx.sessionManager.getLeafId() ?? "" });
 		while (queue.length > MAX_QUEUE) queue.shift();
 		startPump(ctx);
 	});
 
-	pi.on("session_before_compact", async (_event, _ctx) => {
-		// TODO(compact): catch-up update for uncovered entries, then return the
-		// custom compaction with state.summaryText — SPEC §5.3.
-		// Until then: always fall back to native compaction (NFR-4).
-		return undefined;
+	pi.on("session_before_compact", async (event, ctx) => {
+		const instructions = event.customInstructions?.trim() ?? "";
+
+		// "/compact native …" → let pi run its built-in compaction (SPEC §5.3).
+		if (instructions.toLowerCase().startsWith("native")) return undefined;
+
+		// Nothing to inject yet → native fallback (NFR-4).
+		if (!state.summaryText) return undefined;
+
+		const branch = event.branchEntries;
+
+		// Catch-up: entries the rolling summary doesn't cover yet (SPEC §5.2/§5.3).
+		let coveredIdx = state.lastCoveredEntryId
+			? branch.findIndex((e) => e.id === state.lastCoveredEntryId)
+			: -1;
+		if (coveredIdx < 0) {
+			// Coverage invalid (e.g. /tree navigation): catch up from the latest compaction boundary.
+			for (let i = branch.length - 1; i >= 0; i--) {
+				if (branch[i].type === "compaction") {
+					coveredIdx = i;
+					break;
+				}
+			}
+		}
+		const tail = branch.slice(coveredIdx + 1);
+		const uncovered = tail.flatMap((e) => (e.type === "message" ? [e.message] : []));
+		const substantive = uncovered.filter(hasSubstance);
+		if (substantive.length > 0) {
+			const delta = serializeConversation(convertToLlm(substantive));
+			const lastMessageEntry = [...tail].reverse().find((e) => e.type === "message");
+			console.error(`[contextRoller] compaction catch-up: ${substantive.length} uncovered entries`);
+			const ok = await runSummaryUpdate(ctx, { text: delta, entryId: lastMessageEntry?.id ?? "" }, event.signal);
+			if (!ok) return undefined; // NFR-4: native fallback
+		} else if (uncovered.length > 0) {
+			// Only substance-less entries (e.g. aborted messages) — advance the coverage
+			// marker without an LLM call so we don't re-check them next time.
+			const lastMessageEntry = [...tail].reverse().find((e) => e.type === "message");
+			if (lastMessageEntry?.id && lastMessageEntry.id !== state.lastCoveredEntryId) {
+				state = { ...state, lastCoveredEntryId: lastMessageEntry.id };
+				pi.appendEntry(STATE_ENTRY_TYPE, state);
+			}
+		}
+
+		let summary = state.summaryText;
+
+		// FR-7: handoff budget guarantee.
+		if (config.maxSummaryTokens > 0 && estimateTextTokens(summary) > config.maxSummaryTokens) {
+			await compressSummary(ctx, event.signal);
+			summary = state.summaryText;
+		}
+
+		// "/compact <instructions>" → one extra pass applying the user's instructions (SPEC §5.3).
+		if (instructions) {
+			const model = resolveSecondaryModel(ctx);
+			let applied = false;
+			if (model) {
+				try {
+					console.error(`[contextRoller] applying /compact instructions: ${instructions}`);
+					const response = await ctx.modelRegistry.complete(
+						model,
+						{
+							systemPrompt:
+								ROLLING_SUMMARY_PROMPT +
+								budgetClause() +
+								`\n\nAdditional user instruction for this compaction summary: ${instructions}\nApply the instruction to the document you output.`,
+							messages: [
+								{
+									role: "user" as const,
+									content: [
+										{ type: "text" as const, text: `Current state:\n${summary}\n\nOutput the full updated document.` },
+									],
+									timestamp: Date.now(),
+								},
+							],
+						},
+						{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7(), signal: event.signal },
+					);
+					const text = extractText(response);
+					if (text.trim()) {
+						summary = text.trim();
+						applied = true;
+					}
+				} catch (err) {
+					console.error("[contextRoller] instruction pass failed:", err instanceof Error ? err.message : err);
+				}
+			}
+			if (!applied) {
+				ctx.ui.notify("contextRoller: could not apply /compact instructions; injecting plain summary", "warning");
+			}
+		}
+
+		return {
+			compaction: {
+				summary,
+				firstKeptEntryId: firstKeptEntryId(branch),
+				tokensBefore: event.preparation.tokensBefore,
+			},
+		};
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {

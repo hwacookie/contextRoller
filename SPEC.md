@@ -126,6 +126,7 @@ interface RollingSummaryState {
 * Persist after each successful update: `pi.appendEntry("rolling-summary", state)` (TUI-only, not sent to LLM).
 * Reconstruct on `session_start` by scanning branch entries for the latest `rolling-summary` custom entry.
 * Coverage: at compaction time, `event.branchEntries` gives the current branch path; entries after `lastCoveredEntryId` are "uncovered" → serialized as the catch-up delta (5.3). If the branch no longer contains `lastCoveredEntryId` (e.g., `/tree` navigation), coverage is invalid → full catch-up from the latest compaction boundary (rare; one local-model call).
+* Substance filter: messages without recordable content (aborted or empty assistant responses, blank tool results) are skipped by the worker and by catch-up. If an uncovered tail contains only substance-less entries, the coverage marker advances without an LLM call — a mid-stream `/compact` abort must never degrade the document.
 
 ### 5.3 Compaction interception
 
@@ -423,10 +424,11 @@ export default function (pi: ExtensionAPI) {
 - [x] Public GitHub repository, README, English-only documentation rule (AGENTS.md)
 - [x] Extension scaffold (`index.ts`): config loading, state restore, hook stubs, `/contextRoller` command; loads cleanly via `pi -e ./index.ts`
 - [x] Background worker: `turn_end` deltas, FIFO queue with sequential pump, persistence via `appendEntry`; verified end-to-end against a local model (Unsloth Studio) incl. restart round-trip (`summary: restored`)
+- [x] Compaction interception (§5.3): `session_before_compact` custom compaction — fast path, catch-up for uncovered entries (incl. substance-less marker advance), keep policy with cut-point guard, FR-7 handoff budget guarantee, `/compact native …` passthrough, `/compact <instructions>` transform pass. Verified end-to-end via RPC against the local model: fast path (`fromHook=true`, keep-none → context ≈ system prompt + summary), native passthrough (`fromHook=false`), and the instruction transform pass (injected summary differs from worker document)
+- [x] Token budget machinery (FR-7): `maxSummaryTokens` config, prompt clause + per-update compression pass, handoff guarantee at compaction
+- [x] Local server registration via `models.json`; end-to-end RPC test: three compactions in one session against the local secondary model
 
 ### TODO
-- [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down); handle `/compact native …` passthrough and the `/compact <instructions>` transform pass
-- [ ] Token budget (FR-7): `maxSummaryTokens` config, prompt + per-update compression pass, handoff guarantee; upgrade `/contextRoller show` to a Markdown viewer with token count
+- [ ] `/contextRoller show`: upgrade to a Markdown viewer with token count (FR-7 remainder)
 - [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
-- [ ] Local server registration via `models.json`; end-to-end test: long session → compaction → context ≈ system prompt + summary
 - [ ] Project diary: windowing, flush triggers, per-day/per-user files under `<project>/diary/`; verify entries survive restarts, capture discarded approaches, and never enter LLM context
