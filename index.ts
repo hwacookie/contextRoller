@@ -886,7 +886,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerCommand("contextRoller", {
-		description: "Manage rolling context summary + diary (model | now | show | diary [now])",
+		description: "Manage rolling context summary + diary (model | now | show | diary [now] | help)",
 		handler: async (args, ctx) => {
 			const [sub, arg] = (args ?? "").trim().split(/\s+/);
 			switch (sub) {
@@ -947,8 +947,32 @@ export default function (pi: ExtensionAPI) {
 					await showMarkdownOverlay(ctx, `contextRoller — diary ${localDate(new Date())}`, [file], content);
 					break;
 				}
+				case "help": {
+					const helpText = [
+						"## Commands",
+						"",
+						"- **`/contextRoller`** — status: secondary model, summary size, last update",
+						"- **`/contextRoller model`** — pick the secondary model (fuzzy search over pi's catalog)",
+						"- **`/contextRoller now`** — force an immediate summary catch-up update",
+						"- **`/contextRoller show`** — open the rolling summary in a scrollable viewer",
+						"- **`/contextRoller diary`** — show today's diary entries",
+						"- **`/contextRoller diary now`** — flush the current diary window immediately",
+						"",
+						"## How it works",
+					"",
+						"The secondary model updates the rolling summary after every turn; compaction then injects it instead of running a heavy native summarization pass. Diary entries are written when the model judges something meaningful happened (task completed, decision made, approach discarded) — boring turns fold into the next entry.",
+						"",
+						"Config: `.pi/contextRoller.json` (project) or `~/.pi/agent/contextRoller.json` (global). Diary files: `<project>/diary/<YYYY-MM-DD>-<user>.md`.",
+					].join("\n");
+					if (ctx.mode !== "tui") {
+						ctx.ui.notify(helpText, "info");
+						break;
+					}
+					await showMarkdownOverlay(ctx, "contextRoller — help", [], helpText);
+					break;
+				}
 				default:
-					ctx.ui.notify("Usage: /contextRoller [model | now | show | diary [now]]", "error");
+					ctx.ui.notify("Usage: /contextRoller [model | now | show | diary [now] | help]", "error");
 			}
 		},
 	});

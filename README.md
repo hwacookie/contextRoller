@@ -30,6 +30,7 @@ Long-running sessions with large-context models eventually hit the context limit
 | `/contextRoller show` | Open the rolling summary in a scrollable Markdown viewer (token count + budget) |
 | `/contextRoller diary` | Show today's diary entries |
 | `/contextRoller diary now` | Flush the current diary window immediately |
+| `/contextRoller help` | Command reference + short "how it works" |
 
 ## Requirements
 
