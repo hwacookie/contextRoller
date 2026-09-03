@@ -1,0 +1,6 @@
+{
+  "model": "unsloth-studio/gemma-4-E2B-it-MLX-4bit",
+  "keepLastEntries": 0,
+  "maxOutputTokens": 2048,
+  "diary": { "enabled": true, "intervalMinutes": 15, "dir": "diary" }
+}

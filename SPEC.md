@@ -408,10 +408,9 @@ export default function (pi: ExtensionAPI) {
 - [x] Use case 2 (project diary) specified (§5.7, FR-6)
 - [x] Public GitHub repository, README, English-only documentation rule (AGENTS.md)
 - [x] Extension scaffold (`index.ts`): config loading, state restore, hook stubs, `/contextRoller` command; loads cleanly via `pi -e ./index.ts`
+- [x] Background worker: `turn_end` deltas, FIFO queue with sequential pump, persistence via `appendEntry`; verified end-to-end against a local model (Unsloth Studio) incl. restart round-trip (`summary: restored`)
 
 ### TODO
-
-- [ ] Background worker: `turn_end` deltas, FIFO queue, persistence via `appendEntry`; verify round-trip across `/reload` and restart
 - [ ] Compaction interception: `session_before_compact` custom compaction; test all three reasons (`/compact`, threshold, overflow) and the native-fallback path (secondary model down)
 - [ ] `/contextRoller` command: status | model (fuzzy picker over `getAvailable()`) | now | show; verify main model is untouched after selection
 - [ ] Local server registration via `models.json`; end-to-end test: long session → compaction → context ≈ system prompt + summary

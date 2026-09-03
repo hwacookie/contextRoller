@@ -16,9 +16,12 @@ import { join } from "node:path";
 
 import {
 	CONFIG_DIR_NAME,
+	convertToLlm,
 	type ExtensionAPI,
 	type ExtensionContext,
+	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
+import { type Model, uuidv7 } from "@earendil-works/pi-ai";
 
 // ---------------------------------------------------------------------------
 // Configuration (SPEC §5.5)
@@ -101,20 +104,139 @@ function restoreState(ctx: ExtensionContext): RollingSummaryState {
 }
 
 // ---------------------------------------------------------------------------
+// Background worker (SPEC §5.1)
+// ---------------------------------------------------------------------------
+
+const ROLLING_SUMMARY_PROMPT = `You are a state tracking assistant for a coding agent session. You maintain a concise working-memory document that replaces summarized conversation history, so it must stand alone.
+
+Rules:
+- Update the document with the latest interaction; keep it current and concise.
+- Overwrite outdated information (e.g. abandoned approaches) instead of accumulating it.
+- Track files read/modified from tool calls in the tagged sections at the end.
+- Keep exactly this structure:
+
+## Goal
+[What the user is trying to accomplish]
+
+## Constraints & Preferences
+- [Requirements mentioned by user]
+
+## Progress
+### Done
+- [x] ...
+
+### In Progress
+- [ ] ...
+
+### Blocked
+- [...]
+
+## Key Decisions
+- **[Decision]**: [Rationale]
+
+## Next Steps
+1. ...
+
+## Critical Context
+- [Data needed to continue]
+
+<read-files>
+...
+</read-files>
+
+<modified-files>
+...
+</modified-files>`;
+
+interface QueuedDelta {
+	text: string;
+	/** Session leaf id at enqueue time — becomes the coverage marker on success. */
+	entryId: string;
+}
+
+const MAX_QUEUE = 50; // cap memory if the secondary server is down for a long time
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
 	let config: ContextRollerConfig = DEFAULT_CONFIG;
 	let state: RollingSummaryState = { ...EMPTY_STATE };
-	// TODO(worker): FIFO delta queue + sequential pump (SPEC §5.1) — next TODO item.
+	let queue: QueuedDelta[] = [];
+	let activePump: Promise<void> | null = null;
 	// TODO(diary): diary buffer + lastDiaryFlush (SPEC §5.7).
 
 	function statusText(): string {
 		const model = config.model ?? "not configured";
 		const summary = state.summaryText ? `${state.summaryText.length} chars` : "none";
 		const updated = state.updatedAt ? new Date(state.updatedAt).toLocaleTimeString() : "never";
-		return `model: ${model} | summary: ${summary} | updated: ${updated}`;
+		const queued = queue.length > 0 ? ` | queued: ${queue.length}` : "";
+		return `model: ${model} | summary: ${summary} | updated: ${updated}${queued}`;
+	}
+
+	/** Resolve the configured secondary model ("provider/modelId", first slash). */
+	function resolveSecondaryModel(ctx: ExtensionContext): Model<any> | undefined {
+		const ref = config.model;
+		if (!ref) return undefined;
+		const slash = ref.indexOf("/");
+		if (slash <= 0 || slash === ref.length - 1) return undefined;
+		return ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
+	}
+
+	async function doPump(ctx: ExtensionContext): Promise<void> {
+		while (queue.length > 0) {
+			const model = resolveSecondaryModel(ctx);
+			if (!model) break; // unresolvable ref — retry once config/model changes
+			const item = queue.shift()!;
+			if (ctx.hasUI) ctx.ui.setStatus("contextRoller", "updating…");
+			try {
+				const response = await ctx.modelRegistry.complete(
+					model,
+					{
+						systemPrompt: ROLLING_SUMMARY_PROMPT,
+						messages: [
+							{
+								role: "user" as const,
+								content: [
+									{
+										type: "text" as const,
+										text: `Current state:\n${state.summaryText || "(empty)"}\n\nLatest interaction:\n${item.text}`,
+									},
+								],
+								timestamp: Date.now(),
+							},
+						],
+					},
+					{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7() },
+				);
+				const text = response.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map((c) => c.text)
+					.join("\n");
+				if (text.trim()) {
+					state = {
+						summaryText: text.trim(),
+						lastCoveredEntryId: item.entryId || state.lastCoveredEntryId,
+						updatedAt: Date.now(),
+					};
+					pi.appendEntry(STATE_ENTRY_TYPE, state);
+					console.log(`[contextRoller] summary updated (${state.summaryText.length} chars)`);
+				}
+			} catch (err) {
+				console.error("[contextRoller] background update failed:", err instanceof Error ? err.message : err);
+				queue.unshift(item); // retry on the next turn
+				break;
+			}
+		}
+		if (ctx.hasUI) ctx.ui.setStatus("contextRoller", statusText());
+	}
+
+	function startPump(ctx: ExtensionContext): void {
+		if (activePump) return;
+		activePump = doPump(ctx).finally(() => {
+			activePump = null;
+		});
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -128,11 +250,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("turn_end", async (_event, _ctx) => {
-		// TODO(worker): serialize the delta with
-		// serializeConversation(convertToLlm([event.message, ...event.toolResults])),
-		// push it to the queue, and pump via ctx.modelRegistry.complete(secondaryModel, ...) — SPEC §5.1.
-		console.log("[contextRoller] turn_end (background worker not implemented yet)");
+	pi.on("turn_end", async (event, ctx) => {
+		if (!config.model) return; // no secondary model configured — nothing to update
+		const delta = serializeConversation(convertToLlm([event.message, ...event.toolResults]));
+		if (!delta.trim()) return;
+		queue.push({ text: delta, entryId: ctx.sessionManager.getLeafId() ?? "" });
+		while (queue.length > MAX_QUEUE) queue.shift();
+		startPump(ctx);
 	});
 
 	pi.on("session_before_compact", async (_event, _ctx) => {
@@ -159,10 +283,13 @@ export default function (pi: ExtensionAPI) {
 					// TODO(command): fuzzy picker over ctx.modelRegistry.getAvailable() — SPEC §5.4.
 					ctx.ui.notify("not implemented yet (TODO: fuzzy model picker)", "warning");
 					break;
-				case "now":
-					// TODO(worker): force a catch-up update — SPEC §5.1/§5.3.
-					ctx.ui.notify("not implemented yet (TODO: background worker)", "warning");
+				case "now": {
+					if (activePump) await activePump;
+					startPump(ctx);
+					if (activePump) await activePump;
+					ctx.ui.notify(statusText(), "info");
 					break;
+				}
 				case "show":
 					ctx.ui.notify(state.summaryText || "(no summary yet)", "info");
 					break;
