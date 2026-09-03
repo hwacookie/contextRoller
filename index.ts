@@ -440,7 +440,9 @@ export default function (pi: ExtensionAPI) {
 		const dir = join(ctx.cwd, config.diary.dir);
 		const file = join(dir, `${localDate(new Date())}-${diaryUserName(ctx.cwd)}.md`);
 		mkdirSync(dir, { recursive: true });
-		const header = `## ${localDate(new Date(startTs))} ${localTime(new Date(startTs))}–${localTime(new Date(flushTs))} (${diaryUserName(ctx.cwd)})\n`;
+		// Zero-length window (baseline entry) → single time instead of a range.
+		const timeRange = startTs === flushTs ? localTime(new Date(startTs)) : `${localTime(new Date(startTs))}–${localTime(new Date(flushTs))}`;
+		const header = `## ${localDate(new Date(startTs))} ${timeRange} (${diaryUserName(ctx.cwd)})\n`;
 		appendFileSync(file, `${header}${bullets.trim()}\n\n`);
 	}
 
@@ -479,6 +481,83 @@ export default function (pi: ExtensionAPI) {
 		} catch (err) {
 			console.error("[contextRoller] diary flush failed:", err instanceof Error ? err.message : err);
 			return false;
+		}
+	}
+
+	/**
+	 * SPEC §5.7 baseline backfill: if today's diary file has no entries yet and this
+	 * (resumed) session contains substantive content, offer to create a baseline entry
+	 * from the existing session context. Deferred so pi's startup completes first.
+	 */
+	function offerDiaryBaseline(ctx: ExtensionContext): void {
+		if (!config.diary.enabled || !config.model) return;
+		if (ctx.mode !== "tui" || !ctx.hasUI) return; // no dialog outside TUI
+		const file = join(ctx.cwd, config.diary.dir, `${localDate(new Date())}-${diaryUserName(ctx.cwd)}.md`);
+		if (existsSync(file) && readFileSync(file, "utf8").trim()) return; // entries exist today
+		const hasContent = ctx.sessionManager
+			.getBranch()
+			.flatMap((e) => (e.type === "message" ? [e.message] : []))
+			.some(hasSubstance);
+		if (!hasContent) return; // fresh session — nothing to backfill
+		setImmediate(() => {
+			void (async () => {
+				const yes = await ctx.ui.confirm(
+					"contextRoller — diary baseline",
+					"No diary entry for today yet. Create a baseline entry from this session's existing context?\n(Exact timestamps of earlier work are unavailable.)",
+				);
+				if (yes) await runDiaryBaseline(ctx);
+			})().catch((err) => console.error("[contextRoller] diary baseline offer failed:", err instanceof Error ? err.message : err));
+		});
+	}
+
+	/** Write a baseline diary entry from the existing session context (SPEC §5.7). */
+	async function runDiaryBaseline(ctx: ExtensionContext): Promise<void> {
+		const model = resolveSecondaryModel(ctx);
+		if (!model) return;
+		// Source: the rolling summary when available (already condensed), else a capped
+		// raw serialization of the branch (tail — most recent work).
+		let source: string;
+		if (state.summaryText) {
+			source = `Rolling summary of this session:\n${state.summaryText}`;
+			if (diaryWindow.pendingDeltas.trim()) {
+				source += `\n\nRecent activity not yet in the summary:\n${diaryWindow.pendingDeltas}`;
+			}
+		} else {
+			const substantive = ctx.sessionManager
+				.getBranch()
+				.flatMap((e) => (e.type === "message" ? [e.message] : []))
+				.filter(hasSubstance);
+			const raw = serializeConversation(convertToLlm(substantive));
+			source = raw.length > 24_000 ? raw.slice(-24_000) : raw;
+		}
+		try {
+			const response = await ctx.modelRegistry.complete(
+				model,
+				{
+					systemPrompt: DIARY_PROMPT,
+					messages: [
+						{
+							role: "user" as const,
+							content: [
+								{
+									type: "text" as const,
+									text: `Baseline entry — session context (exact timestamps of earlier work are unavailable):\n${source}`,
+								},
+							],
+							timestamp: Date.now(),
+						},
+					],
+				},
+				{ maxTokens: config.maxOutputTokens, cacheRetention: "none", sessionId: uuidv7() },
+			);
+			const bullets = extractText(response).trim();
+			if (!bullets) throw new Error("empty response");
+			appendDiaryEntry(ctx, Date.now(), Date.now(), bullets);
+			console.error("[contextRoller] diary baseline written");
+			ctx.ui.notify("contextRoller: diary baseline entry written", "info");
+		} catch (err) {
+			console.error("[contextRoller] diary baseline failed:", err instanceof Error ? err.message : err);
+			ctx.ui.notify("contextRoller: baseline entry failed", "warning");
 		}
 	}
 
@@ -567,6 +646,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("contextRoller", statusText());
 		}
+		offerDiaryBaseline(ctx); // SPEC §5.7: baseline backfill offer (TUI only, deferred)
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
