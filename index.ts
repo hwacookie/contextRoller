@@ -9,8 +9,9 @@
  * Design: SPEC.md (verified against pi 0.84.3).
  * Load for testing:  pi -e ./index.ts
  *
- * Note: diagnostics go to stderr (console.error) — stdout is reserved for pi's
- * own output and the RPC protocol.
+ * Note: diagnostics go to stderr in non-TUI modes (stdout is reserved for pi's
+ * own output and the RPC protocol). In TUI mode they are suppressed — the
+ * terminal belongs to the TUI, and the status line covers state there.
  */
 
 import { execFileSync } from "node:child_process";
@@ -64,6 +65,15 @@ const DEFAULT_CONFIG: ContextRollerConfig = {
 	diary: { enabled: true, maxWindowMinutes: 60, dir: "diary" },
 };
 
+/** Current pi run mode (set at session_start); gates stderr diagnostics. */
+let runMode: string | undefined;
+
+/** Diagnostics: stderr in non-TUI modes, suppressed in TUI (its terminal is not ours to write). */
+function log(...parts: unknown[]): void {
+	if (runMode === "tui") return;
+	console.error("[contextRoller]", ...parts);
+}
+
 /** Load config: global (~/.pi/agent) first, project (.pi/) overrides. */
 function loadConfig(cwd: string): { config: ContextRollerConfig; modelSourcePath: string | null } {
 	const candidates = [
@@ -79,7 +89,7 @@ function loadConfig(cwd: string): { config: ContextRollerConfig; modelSourcePath
 			if (typeof parsed.model === "string") modelSourcePath = path; // last (most specific) wins
 			merged = { ...merged, ...parsed };
 		} catch (err) {
-			console.error(`[contextRoller] failed to parse config ${path}:`, err);
+			log(`failed to parse config ${path}:`, err);
 		}
 	}
 	return {
@@ -104,7 +114,7 @@ function persistModel(cwd: string, sourcePath: string | null, model: string): vo
 		mkdirSync(dirname(target), { recursive: true });
 		writeFileSync(target, JSON.stringify(existing, null, 2) + "\n");
 	} catch (err) {
-		console.error("[contextRoller] failed to persist model selection:", err);
+		log("failed to persist model selection:", err);
 	}
 }
 
@@ -376,14 +386,14 @@ export default function (pi: ExtensionAPI) {
 				updatedAt: Date.now(),
 			};
 			pi.appendEntry(STATE_ENTRY_TYPE, state);
-			console.error(`[contextRoller] summary updated (${state.summaryText.length} chars)`);
+			log(`summary updated (${state.summaryText.length} chars)`);
 			// FR-7: keep the document within budget.
 			if (config.maxSummaryTokens > 0 && estimateTextTokens(state.summaryText) > config.maxSummaryTokens) {
 				await compressSummary(ctx);
 			}
 			return { ok: true, diaryWrite };
 		} catch (err) {
-			console.error("[contextRoller] summary update failed:", err instanceof Error ? err.message : err);
+			log("summary update failed:", err instanceof Error ? err.message : err);
 			return { ok: false };
 		}
 	}
@@ -411,10 +421,10 @@ export default function (pi: ExtensionAPI) {
 			if (text.trim()) {
 				state = { ...state, summaryText: text.trim(), updatedAt: Date.now() };
 				pi.appendEntry(STATE_ENTRY_TYPE, state);
-				console.error(`[contextRoller] summary compressed to ${state.summaryText.length} chars`);
+				log(`summary compressed to ${state.summaryText.length} chars`);
 			}
 		} catch (err) {
-			console.error("[contextRoller] compression failed:", err instanceof Error ? err.message : err);
+			log("compression failed:", err instanceof Error ? err.message : err);
 		}
 	}
 
@@ -476,10 +486,10 @@ export default function (pi: ExtensionAPI) {
 			// Window is written — reset it (keep the coverage marker at the flushed position).
 			diaryWindow = { windowStartTs: 0, pendingDeltas: "", lastCoveredEntryId: job.entryId || diaryWindow.lastCoveredEntryId };
 			persistDiaryWindow(ctx);
-			console.error("[contextRoller] diary entry written");
+			log("diary entry written");
 			return true;
 		} catch (err) {
-			console.error("[contextRoller] diary flush failed:", err instanceof Error ? err.message : err);
+			log("diary flush failed:", err instanceof Error ? err.message : err);
 			return false;
 		}
 	}
@@ -506,7 +516,7 @@ export default function (pi: ExtensionAPI) {
 					"No diary entry for today yet. Create a baseline entry from this session's existing context?\n(Exact timestamps of earlier work are unavailable.)",
 				);
 				if (yes) await runDiaryBaseline(ctx);
-			})().catch((err) => console.error("[contextRoller] diary baseline offer failed:", err instanceof Error ? err.message : err));
+			})().catch((err) => log("diary baseline offer failed:", err instanceof Error ? err.message : err));
 		});
 	}
 
@@ -553,10 +563,10 @@ export default function (pi: ExtensionAPI) {
 			const bullets = extractText(response).trim();
 			if (!bullets) throw new Error("empty response");
 			appendDiaryEntry(ctx, Date.now(), Date.now(), bullets);
-			console.error("[contextRoller] diary baseline written");
+			log("diary baseline written");
 			ctx.ui.notify("contextRoller: diary baseline entry written", "info");
 		} catch (err) {
-			console.error("[contextRoller] diary baseline failed:", err instanceof Error ? err.message : err);
+			log("diary baseline failed:", err instanceof Error ? err.message : err);
 			ctx.ui.notify("contextRoller: baseline entry failed", "warning");
 		}
 	}
@@ -609,7 +619,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		if (ctx.hasUI) ctx.ui.setStatus("contextRoller", statusText());
-		console.error("[contextRoller] idle"); // queue drained — test/diagnostic signal
+		log("idle"); // queue drained — test/diagnostic signal (non-TUI only)
 	}
 
 	function startPump(ctx: ExtensionContext): void {
@@ -635,13 +645,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		runMode = ctx.mode; // gates stderr diagnostics (TUI suppresses them)
 		const loaded = loadConfig(ctx.cwd);
 		config = loaded.config;
 		modelSourcePath = loaded.modelSourcePath;
 		state = restoreState(ctx);
 		diaryWindow = restoreDiaryWindow(ctx);
-		console.error(
-			`[contextRoller] loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"}, diary window: ${diaryWindow.pendingDeltas.trim() ? "pending" : "empty"})`,
+		log(
+			`loaded (summary: ${state.summaryText ? "restored" : "none"}, secondary model: ${config.model ?? "not configured"}, diary window: ${diaryWindow.pendingDeltas.trim() ? "pending" : "empty"})`,
 		);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("contextRoller", statusText());
@@ -718,7 +729,7 @@ export default function (pi: ExtensionAPI) {
 		if (substantive.length > 0) {
 			const delta = serializeConversation(convertToLlm(substantive));
 			const lastMessageEntry = [...tail].reverse().find((e) => e.type === "message");
-			console.error(`[contextRoller] compaction catch-up: ${substantive.length} uncovered entries`);
+			log(`compaction catch-up: ${substantive.length} uncovered entries`);
 			const res = await runSummaryUpdate(ctx, { text: delta, entryId: lastMessageEntry?.id ?? "" }, event.signal);
 			if (!res.ok) return undefined; // NFR-4: native fallback
 			// Diary judgment at rollover (SPEC §5.7): the window carries the rollover note.
@@ -750,7 +761,7 @@ export default function (pi: ExtensionAPI) {
 			let applied = false;
 			if (model) {
 				try {
-					console.error(`[contextRoller] applying /compact instructions: ${instructions}`);
+					log(`applying /compact instructions: ${instructions}`);
 					const response = await ctx.modelRegistry.complete(
 						model,
 						{
@@ -777,7 +788,7 @@ export default function (pi: ExtensionAPI) {
 						applied = true;
 					}
 				} catch (err) {
-					console.error("[contextRoller] instruction pass failed:", err instanceof Error ? err.message : err);
+					log("instruction pass failed:", err instanceof Error ? err.message : err);
 				}
 			}
 			if (!applied) {
