@@ -645,6 +645,11 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (ctx.hasUI) {
 			ctx.ui.setStatus("contextRoller", statusText());
+			if (!config.model) {
+				// No secondary model configured (global or project) — the extension stays
+				// inactive; tell the user once per session how to fix it.
+				ctx.ui.notify("contextRoller: no secondary model configured — run /contextRoller model to pick one", "warning");
+			}
 		}
 		offerDiaryBaseline(ctx); // SPEC §5.7: baseline backfill offer (TUI only, deferred)
 	});
